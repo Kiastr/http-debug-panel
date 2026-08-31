@@ -1,0 +1,9 @@
+# 运行时数据（含根证书私钥、日志、PID，切勿提交）
+data/
+
+# 依赖
+node_modules/
+
+# 临时文件
+*.log
+linkcheck.txt
