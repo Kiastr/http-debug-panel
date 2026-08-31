@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>HTTP 调试面板</title>
+<style>
+  :root {
+    --bg: #1e1f24; --panel: #26272e; --border: #3a3b44;
+    --text: #d8d9de; --dim: #8a8b94; --accent: #4f9cf9;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 13px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin-right: 6px; }
+  button { background: #33343c; color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #40414a; }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #status { font-size: 12px; color: var(--dim); }
+  #status.on { color: var(--ok); }
+  input[type=text] { background: #1b1c20; border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 4px 8px; width: 220px; font-size: 12px; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #list-pane { flex: 1.1; overflow: auto; border-right: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; }
+  th { position: sticky; top: 0; background: var(--panel); text-align: left; padding: 5px 8px; font-weight: 600; color: var(--dim); border-bottom: 1px solid var(--border); font-size: 12px; z-index: 1; }
+  td { padding: 4px 8px; border-bottom: 1px solid #2c2d34; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+  tr.row { cursor: pointer; }
+  tr.row:hover { background: #2c2d35; }
+  tr.row.selected { background: #2f3a4d; }
+  .m { display: inline-block; width: 42px; font-weight: 700; font-size: 11px; }
+  .m-GET { color: var(--ok); } .m-POST { color: var(--accent); }
+  .m-PUT { color: var(--warn); } .m-DELETE { color: var(--err); }
+  .st-2 { color: var(--ok); } .st-3 { color: var(--warn); } .st-4, .st-5, .st-err { color: var(--err); }
+  #detail-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #detail-head { padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border); word-break: break-all; }
+  #tabs { display: flex; gap: 2px; background: var(--panel); padding: 0 8px; border-bottom: 1px solid var(--border); }
+  #tabs button { border: none; border-radius: 0; background: none; padding: 7px 14px; color: var(--dim); }
+  #tabs button.active { color: var(--text); border-bottom: 2px solid var(--accent); background: none; }
+  #detail-body { flex: 1; overflow: auto; padding: 10px 12px; }
+  pre { white-space: pre-wrap; word-break: break-all; font-family: Consolas, monospace; font-size: 12px; }
+  .kv { margin-bottom: 2px; }
+  .kv b { color: var(--accent); font-weight: 600; }
+  #empty { color: var(--dim); text-align: center; margin-top: 60px; }
+  .badge { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #33343c; color: var(--dim); }
+  .scheme-https { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 HTTP 调试面板</h1>
+  <button id="btn-clear">清空</button>
+  <button id="btn-pause">暂停</button>
+  <input type="text" id="filter" placeholder="过滤：域名 / 关键词 / status:4xx">
+  <span class="badge" id="count">0 条</span>
+  <span style="flex:1"></span>
+  <span id="status">系统代理：检测中…</span>
+  <button id="btn-proxy">开启系统代理</button>
+  <button id="btn-ca">下载根证书</button>
+</header>
+<main>
+  <div id="list-pane">
+    <table>
+      <thead><tr>
+        <th style="width:50px">#</th><th style="width:70px">时间</th>
+        <th style="width:60px">方法</th><th>URL</th>
+        <th style="width:60px">状态</th><th style="width:70px">耗时</th><th style="width:80px">大小</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty">暂无流量 —— 开启系统代理后刷新浏览器，或让程序走代理 127.0.0.1:8888</div>
+  </div>
+  <div id="detail-pane">
+    <div id="detail-head">选择左侧一条记录查看详情</div>
+    <div id="tabs">
+      <button class="active" data-tab="req">请求</button>
+      <button data-tab="res">响应</button>
+      <button data-tab="reqh">请求头</button>
+      <button data-tab="resh">响应头</button>
+    </div>
+    <div id="detail-body"></div>
+  </div>
+</main>
+<script>
+const rowsEl = document.getElementById('rows');
+const list = [];
+const filterEl = document.getElementById('filter');
+let paused = false, selectedId = null, currentDetail = null, currentTab = 'req';
+
+const fmtSize = (n) => n > 1048576 ? (n/1048576).toFixed(1)+' MB' : n > 1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
+const fmtTime = (t) => new Date(t).toTimeString().slice(0,8);
+const esc = (s) => String(s === undefined || s === null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function matchFilter(r) {
+  const q = filterEl.value.trim().toLowerCase();
+  if (!q) return true;
+  const m = q.match(/^status:(\d)xx$/);
+  if (m) return String(r.status).startsWith(m[1]);
+  if (q === 'err') return !!r.error;
+  return r.url.toLowerCase().includes(q) || r.host.toLowerCase().includes(q);
+}
+
+function renderRow(r) {
+  const tr = document.createElement('tr');
+  tr.className = 'row'; tr.dataset.id = r.id;
+  const stCls = r.error ? 'st-err' : 'st-' + String(r.status)[0];
+  tr.innerHTML =
+    '<td>' + r.id + '</td>' +
+    '<td>' + fmtTime(r.time) + '</td>' +
+    '<td><span class="m m-' + esc(r.method) + '">' + esc(r.method) + '</span>' +
+      (r.scheme === 'https' ? ' <span class="scheme-https" title="已解密的 HTTPS">🔒</span>' : '') + '</td>' +
+    '<td title="' + esc(r.url) + '">' + esc(r.url) + '</td>' +
+    '<td class="' + stCls + '">' + (r.error ? 'ERR' : r.status || '…') + '</td>' +
+    '<td>' + (r.durationMs ? r.durationMs + 'ms' : '') + '</td>' +
+    '<td>' + fmtSize(r.size) + '</td>';
+  tr.onclick = () => select(r.id);
+  return tr;
+}
+
+function refreshList() {
+  rowsEl.innerHTML = '';
+  const shown = list.filter(matchFilter);
+  shown.forEach(r => rowsEl.appendChild(renderRow(r)));
+  document.getElementById('count').textContent = shown.length + ' / ' + list.length + ' 条';
+  document.getElementById('empty').style.display = shown.length ? 'none' : 'block';
+  if (selectedId) {
+    const tr = rowsEl.querySelector('tr[data-id="' + selectedId + '"]');
+    if (tr) tr.classList.add('selected');
+  }
+}
+
+function upsert(rec) {
+  const i = list.findIndex(r => r.id === rec.id);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  if (list.length > 500) list.shift();
+}
+
+async function select(id) {
+  selectedId = id;
+  rowsEl.querySelectorAll('tr').forEach(tr => tr.classList.toggle('selected', tr.dataset.id == id));
+  const res = await fetch('/api/record?id=' + id);
+  currentDetail = await res.json();
+  document.getElementById('detail-head').innerHTML =
+    '<b>' + esc(currentDetail.method) + '</b> ' + esc(currentDetail.url) +
+    ' <span class="badge">' + esc(currentDetail.error || currentDetail.status) + '</span>';
+  renderTab();
+}
+
+function renderTab() {
+  const d = currentDetail, el = document.getElementById('detail-body');
+  if (!d) return;
+  const headers = (h) => Object.entries(h || {}).map(([k,v]) => '<div class="kv"><b>' + esc(k) + '</b>: ' + esc(v) + '</div>').join('');
+  const pretty = (text, ct) => {
+    if (/json/.test(ct || '')) { try { return JSON.stringify(JSON.parse(text), null, 2); } catch(_) {} }
+    return text;
+  };
+  if (currentTab === 'req') {
+    el.innerHTML = d.reqBodyText ? '<pre>' + esc(pretty(d.reqBodyText, d.reqContentType)) + '</pre>' : '<pre style="color:var(--dim)">（无请求体）</pre>';
+  } else if (currentTab === 'res') {
+    el.innerHTML = d.error
+      ? '<pre style="color:var(--err)">代理错误：' + esc(d.error) + '</pre>'
+      : d.resBodyText ? '<pre>' + esc(pretty(d.resBodyText, d.resContentType)) + '</pre>' : '<pre style="color:var(--dim)">（无响应体 / 仍在接收）</pre>';
+  } else if (currentTab === 'reqh') {
+    el.innerHTML = headers(d.reqHeaders);
+  } else {
+    el.innerHTML = headers(d.resHeaders);
+  }
+}
+
+document.querySelectorAll('#tabs button').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentTab = btn.dataset.tab;
+    renderTab();
+  };
+});
+
+document.getElementById('btn-clear').onclick = () => {
+  list.length = 0; refreshList();
+  document.getElementById('detail-head').textContent = '选择左侧一条记录查看详情';
+  document.getElementById('detail-body').innerHTML = '';
+};
+document.getElementById('btn-pause').onclick = (e) => {
+  paused = !paused;
+  e.target.classList.toggle('active', paused);
+  e.target.textContent = paused ? '已暂停' : '暂停';
+};
+filterEl.oninput = refreshList;
+
+// ---------- WebSocket 实时推送 ----------
+function connect() {
+  const ws = new WebSocket('ws://' + location.host + '/live');
+  ws.onmessage = (ev) => {
+    if (paused) return;
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'new' || msg.type === 'update') {
+      upsert(msg.record);
+      refreshList();
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+
+// ---------- 系统代理开关 ----------
+const btnProxy = document.getElementById('btn-proxy');
+const statusEl = document.getElementById('status');
+async function refreshProxyState() {
+  try {
+    const res = await fetch('/api/proxy/state');
+    const j = await res.json();
+    statusEl.textContent = j.enabled ? '系统代理：已开启 → 127.0.0.1:' + j.port : '系统代理：已关闭';
+    statusEl.className = j.enabled ? 'on' : '';
+    btnProxy.textContent = j.enabled ? '关闭系统代理' : '开启系统代理';
+    btnProxy.classList.toggle('active', j.enabled);
+  } catch(_) {}
+}
+btnProxy.onclick = async () => {
+  const enable = !btnProxy.classList.contains('active');
+  statusEl.textContent = '切换中…';
+  const res = await fetch('/api/proxy/set?enable=' + (enable ? 1 : 0));
+  const j = await res.json();
+  if (!j.ok) alert('切换失败：' + j.error);
+  refreshProxyState();
+};
+document.getElementById('btn-ca').onclick = () => location.href = '/api/download-ca';
+
+// ---------- 初始化 ----------
+(async () => {
+  const res = await fetch('/api/records');
+  (await res.json()).forEach(upsert);
+  refreshList();
+  refreshProxyState();
+  connect();
+})();
+</script>
+</body>
+</html>
